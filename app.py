@@ -637,6 +637,7 @@ async def request_key_page(request: Request):
       <div id="keys-list"></div>
     </div>
   </div>
+  <div id="root-data" data-username="__USERNAME__"></div>
   <script>
     const form = document.getElementById('key-form');
     const statusEl = document.getElementById('status');
@@ -714,7 +715,7 @@ async def request_key_page(request: Request):
 
     loadKeys();
   </script>
-  <div id="root-data" data-username="__USERNAME__"></div>
+
 </body>
 </html>
         """
