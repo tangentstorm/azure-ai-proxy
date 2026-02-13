@@ -1,0 +1,20 @@
+## add the following lines to the top of your
+##     ~/.codex/config.toml (global)
+## or  ./.codex/config.toml (per-project)
+##
+## then run:
+##
+## PROXY_API_KEY=key-you-got-from-the-proxy codex
+
+model = "gpt-5.2-codex"
+model_reasoning_effort = "high"
+
+model_provider="proxy"
+
+[model_providers.proxy]
+name         = "1010data AI Proxy"
+base_url     = "http://localhost:8000/v1"
+env_key      = "PROXY_API_KEY"
+wire_api     = "responses"                   
+query_params = { api-version = "preview" }
+
