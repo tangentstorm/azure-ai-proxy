@@ -287,58 +287,64 @@ async def proxy(
         if use_responses_endpoint and stream_requested:
             upstream_headers.setdefault("Accept", "text/event-stream")
 
+    if stream_requested:
+        # For streaming, the client must outlive the function return since the
+        # generator is consumed later by the ASGI server.  Create it without a
+        # context manager and close it in the generator's finally block.
+        timeout = httpx.Timeout(60.0, connect=10.0, read=120.0, write=60.0)
+        client = httpx.AsyncClient(timeout=timeout)
+        stream_ctx = client.stream(
+            request.method,
+            url,
+            params=params,
+            headers=upstream_headers,
+            content=raw_body,
+        )
+        upstream_resp = await stream_ctx.__aenter__()
+        usage_seen: Optional[Dict[str, Any]] = None
+        model_seen: Optional[str] = None
+
+        async def stream_iter():
+            nonlocal usage_seen, model_seen
+            try:
+                async for line in upstream_resp.aiter_lines():
+                    if line.startswith("data:"):
+                        data = line[len("data:") :].strip()
+                        if data and data != "[DONE]":
+                            try:
+                                payload = json.loads(data)
+                                model_seen = payload.get("model") or model_seen
+                                if payload.get("usage"):
+                                    usage_seen = payload["usage"]
+                            except json.JSONDecodeError:
+                                pass
+                    yield (line + "\n").encode("utf-8")
+            except asyncio.CancelledError:
+                logger.info("[stream] client disconnected")
+            except Exception as exc:
+                logger.warning("[stream] upstream stream error: %s", repr(exc))
+            finally:
+                await stream_ctx.__aexit__(None, None, None)
+                await client.aclose()
+                if usage_seen and model_seen:
+                    store_usage(
+                        client_key["token"],
+                        client_key["label"],
+                        model_seen,
+                        usage_seen,
+                        MODEL_PRICING,
+                    )
+
+        return StreamingResponse(
+            stream_iter(),
+            status_code=upstream_resp.status_code,
+            headers=filtered_response_headers(upstream_resp.headers),
+            media_type=upstream_resp.headers.get("content-type"),
+        )
+
+    # Non-streaming request
     timeout = httpx.Timeout(60.0, connect=10.0, read=60.0, write=60.0)
     async with httpx.AsyncClient(timeout=timeout) as client:
-        if stream_requested:
-            stream_ctx = client.stream(
-                request.method,
-                url,
-                params=params,
-                headers=upstream_headers,
-                content=raw_body,
-            )
-            upstream_resp = await stream_ctx.__aenter__()
-            usage_seen: Optional[Dict[str, Any]] = None
-            model_seen: Optional[str] = None
-
-            async def stream_iter():
-                nonlocal usage_seen, model_seen
-                try:
-                    async for line in upstream_resp.aiter_lines():
-                        if line.startswith("data:"):
-                            data = line[len("data:") :].strip()
-                            if data and data != "[DONE]":
-                                try:
-                                    payload = json.loads(data)
-                                    model_seen = payload.get("model") or model_seen
-                                    if payload.get("usage"):
-                                        usage_seen = payload["usage"]
-                                except json.JSONDecodeError:
-                                    pass
-                        yield (line + "\n").encode("utf-8")
-                except asyncio.CancelledError:
-                    logger.info("[stream] client disconnected")
-                except Exception as exc:
-                    logger.warning("[stream] upstream stream error: %s", repr(exc))
-                finally:
-                    await stream_ctx.__aexit__(None, None, None)
-                    if usage_seen and model_seen:
-                        store_usage(
-                            client_key["token"],
-                            client_key["label"],
-                            model_seen,
-                            usage_seen,
-                            MODEL_PRICING,
-                        )
-
-            return StreamingResponse(
-                stream_iter(),
-                status_code=upstream_resp.status_code,
-                headers=filtered_response_headers(upstream_resp.headers),
-                media_type=upstream_resp.headers.get("content-type"),
-            )
-
-        # Non-streaming request
         upstream_resp = await client.request(
             request.method,
             url,
