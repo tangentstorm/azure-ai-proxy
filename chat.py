@@ -1,3 +1,12 @@
+"""
+this is an experimental and currently unused plugin
+to make the server forward requests for /v1/completions
+to /v1/responses. It was basically an experiment to get
+cline (which at the time does not yet support /v1/responses)
+to work with newer models (which require /v1/responses).
+
+so far i have not gotten this to work.
+"""
 import json
 import time
 from typing import Any, Dict, Optional
