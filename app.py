@@ -37,6 +37,8 @@ logger.info(
     os.getenv("UPSTREAM_API_VERSION"),
 )
 
+import ldap_plugin  # noqa: E402
+
 from tracking import (  # noqa: E402
     create_api_key,
     fetch_active_keys_for_label,
@@ -132,54 +134,23 @@ def resolve_username(request: Request) -> str:
 def require_username(request: Request) -> str:
     return resolve_username(request)
 
-def login_redirect(request: Request) -> RedirectResponse:
-    """Redirect to login with a next parameter pointing back to the requested path."""
-    next_path = request.url.path
-    if request.url.query:
-        next_path = f"{next_path}?{request.url.query}"
-    return RedirectResponse(url=f"/login?next={quote(next_path)}", status_code=302)
 
-
-def sanitized_next(target: Optional[str]) -> str:
-    """Allow only relative paths for post-login redirects to avoid open redirects."""
-    if target and target.startswith("/"):
-        return target
-    return "/"
-
-
-@app.on_event("startup")
-async def on_startup():
-    init_db()
-    try:
-        await refresh_models_cache()
-        logger.info(
-            "[models] cached %s models",
-            len(get_models_snapshot()[0]),
-        )
-    except Exception as exc:
-        logger.warning("[models] startup fetch failed: %s", repr(exc))
-
-
-@app.get("/healthz")
-async def health():
-    return {"status": "ok"}
-
-
-@app.get("/debug/last-response")
-async def debug_last_response(request: Request):
-    require_username(request)
-    return get_debug_state()
-
-
-@app.get("/login", response_class=HTMLResponse)
-async def login_page(request: Request, next: Optional[str] = "/"):
-    target = sanitized_next(next)
-    try:
-        resolve_username(request)
-        return RedirectResponse(url=target, status_code=302)
-    except HTTPException:
-        pass
-
+def build_login_html(
+    target: str, ldap_enabled: bool, error_message: Optional[str] = None
+) -> str:
+    error_block = ""
+    if error_message:
+        error_block = f'<div class="error">{html.escape(error_message)}</div>'
+    password_block = ""
+    login_copy = "No passwords yet. Enter a username to set your session cookie."
+    login_hint = "We set a cookie named <code>proxy_username</code> for local navigation."
+    if ldap_enabled:
+        login_copy = "Use your LDAP username and password to sign in."
+        login_hint = "Credentials are verified against LDAP before setting your session."
+        password_block = """
+      <label for="password">Password</label>
+      <input id="password" name="password" type="password" autocomplete="current-password" required />
+"""
     content = """
 <!DOCTYPE html>
 <html lang="en">
@@ -247,18 +218,29 @@ async def login_page(request: Request, next: Optional[str] = "/"):
     button:hover { transform: translateY(-1px); box-shadow: 0 12px 36px rgba(34, 211, 238, 0.35); }
     button:active { transform: translateY(0); }
     .hint { font-size: 14px; color: var(--muted); margin-top: 8px; }
+    .error {
+      background: rgba(248, 113, 113, 0.12);
+      border: 1px solid rgba(248, 113, 113, 0.35);
+      color: #fecaca;
+      padding: 10px 12px;
+      border-radius: 12px;
+      margin-bottom: 12px;
+      font-size: 14px;
+    }
   </style>
 </head>
 <body>
   <div class="card">
     <h1>Sign in</h1>
-    <p>No passwords yet. Enter a username to set your session cookie.</p>
+    <p>__LOGIN_COPY__</p>
+    __ERROR__
     <form method="POST" action="/login">
       <input type="hidden" name="next" value="__NEXT__" />
       <label for="username">Username</label>
       <input id="username" name="username" placeholder="e.g. codex" autocomplete="username" required />
+__PASSWORD__
       <button type="submit">Continue</button>
-      <p class="hint">We set a cookie named <code>proxy_username</code> for local navigation.</p>
+      <p class="hint">__LOGIN_HINT__</p>
     </form>
   </div>
   <script>
@@ -269,15 +251,99 @@ async def login_page(request: Request, next: Optional[str] = "/"):
 </body>
 </html>
     """
-    return HTMLResponse(content.replace("__NEXT__", html.escape(target)))
+    return (
+        content.replace("__NEXT__", html.escape(target))
+        .replace("__PASSWORD__", password_block)
+        .replace("__ERROR__", error_block)
+        .replace("__LOGIN_COPY__", login_copy)
+        .replace("__LOGIN_HINT__", login_hint)
+    )
+
+
+def login_redirect(request: Request) -> RedirectResponse:
+    """Redirect to login with a next parameter pointing back to the requested path."""
+    next_path = request.url.path
+    if request.url.query:
+        next_path = f"{next_path}?{request.url.query}"
+    return RedirectResponse(url=f"/login?next={quote(next_path)}", status_code=302)
+
+
+def sanitized_next(target: Optional[str]) -> str:
+    """Allow only relative paths for post-login redirects to avoid open redirects."""
+    if target and target.startswith("/"):
+        return target
+    return "/"
+
+
+@app.on_event("startup")
+async def on_startup():
+    init_db()
+    try:
+        await refresh_models_cache()
+        logger.info(
+            "[models] cached %s models",
+            len(get_models_snapshot()[0]),
+        )
+    except Exception as exc:
+        logger.warning("[models] startup fetch failed: %s", repr(exc))
+
+
+@app.get("/healthz")
+async def health():
+    return {"status": "ok"}
+
+
+@app.get("/debug/last-response")
+async def debug_last_response(request: Request):
+    require_username(request)
+    return get_debug_state()
+
+
+@app.get("/login", response_class=HTMLResponse)
+async def login_page(request: Request, next: Optional[str] = "/"):
+    target = sanitized_next(next)
+    try:
+        resolve_username(request)
+        return RedirectResponse(url=target, status_code=302)
+    except HTTPException:
+        pass
+    ldap_enabled = ldap_plugin.ldap_enabled()
+    return HTMLResponse(build_login_html(target, ldap_enabled))
 
 
 @app.post("/login")
-async def login(username: str = Form(...), next: str = Form("/")):
+async def login(
+    username: str = Form(...),
+    password: Optional[str] = Form(None),
+    next: str = Form("/"),
+):
     username = (username or "").strip()
     if not username:
         raise HTTPException(status_code=400, detail="username is required")
     target = sanitized_next(next)
+    ldap_enabled = ldap_plugin.ldap_enabled()
+    if ldap_enabled:
+        password = (password or "").strip()
+        if not password:
+            return HTMLResponse(
+                build_login_html(
+                    target, ldap_enabled, error_message="Password is required."
+                ),
+                status_code=400,
+            )
+        try:
+            if not ldap_plugin.authenticate(username, password):
+                return HTMLResponse(
+                    build_login_html(
+                        target,
+                        ldap_enabled,
+                        error_message="Invalid username or password.",
+                    ),
+                    status_code=401,
+                )
+        except RuntimeError as exc:
+            logger.exception("[ldap] authentication failed: %s", exc)
+            raise HTTPException(status_code=500, detail=str(exc))
     response = RedirectResponse(url=target, status_code=303)
     response.set_cookie(
         key="proxy_username",
