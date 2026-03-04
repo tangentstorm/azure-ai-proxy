@@ -421,48 +421,17 @@ async def root(request: Request):
       box-shadow: 0 8px 30px rgba(34, 211, 238, 0.15);
     }
     a:hover { transform: translateY(-1px); box-shadow: 0 12px 36px rgba(34, 211, 238, 0.25); }
-    .pills { display:flex; flex-wrap:wrap; gap:8px; margin-top:12px; }
-    .pill { padding:6px 12px; border-radius:999px; border:1px solid rgba(255,255,255,0.12); background:rgba(255,255,255,0.05); color:#e2e8f0; font-weight:600; }
   </style>
 </head>
 <body>
   <div class="card">
     <h1>Proxy Portal</h1>
     <p>Signed in as <strong>__USERNAME__</strong>. Request keys and view cost reports for your team.</p>
-    <div>
-      <div style="font-weight:700; margin-bottom:6px;">Available models</div>
-      <div class="pills" id="models"><span class="pill">Loading…</span></div>
-    </div>
     <div class="links">
       <a href="/request-key">Request or view keys</a>
       <a href="/reports">Cost reports</a>
     </div>
   </div>
-  <script>
-    async function loadModels() {
-      const el = document.getElementById('models');
-      try {
-        const res = await fetch('/models');
-        if (!res.ok) throw new Error('Failed to load models');
-        const data = await res.json();
-        const models = data.models || [];
-        if (!models.length) {
-          el.innerHTML = '<span class="pill">No models returned</span>';
-          return;
-        }
-        el.innerHTML = '';
-        models.forEach((m) => {
-          const span = document.createElement('span');
-          span.className = 'pill';
-          span.textContent = m;
-          el.appendChild(span);
-        });
-      } catch (err) {
-        el.innerHTML = '<span class="pill">Unable to load models</span>';
-      }
-    }
-    loadModels();
-  </script>
 </body>
 </html>
         """
