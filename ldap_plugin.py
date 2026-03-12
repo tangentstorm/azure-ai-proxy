@@ -32,6 +32,21 @@ class LdapConfig:
     search_base: str
     search_filter: str
     domain: Optional[str]
+    connect_timeout_seconds: float
+    receive_timeout_seconds: float
+
+
+def _load_timeout_env(name: str, default: float) -> float:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be a number of seconds") from exc
+    if value <= 0:
+        raise RuntimeError(f"{name} must be > 0")
+    return value
 
 
 def _load_config() -> LdapConfig:
@@ -43,6 +58,8 @@ def _load_config() -> LdapConfig:
         "LDAP_FILTER", "(&(objectClass=person)(userPrincipalName=%s))"
     ).strip()
     domain = os.getenv("LDAP_DOMAIN", "").strip() or None
+    connect_timeout_seconds = _load_timeout_env("LDAP_CONNECT_TIMEOUT_SECONDS", 5.0)
+    receive_timeout_seconds = _load_timeout_env("LDAP_RECEIVE_TIMEOUT_SECONDS", 10.0)
 
     missing = [
         name
@@ -65,6 +82,8 @@ def _load_config() -> LdapConfig:
         search_base=search_base,
         search_filter=search_filter,
         domain=domain,
+        connect_timeout_seconds=connect_timeout_seconds,
+        receive_timeout_seconds=receive_timeout_seconds,
     )
 
 
@@ -84,7 +103,10 @@ def _get_server(config: LdapConfig):
     global _server
     if _server is None:
         Server, _, _, _ = _ldap3_imports()
-        _server = Server(config.server_uri)
+        _server = Server(
+            config.server_uri,
+            connect_timeout=config.connect_timeout_seconds,
+        )
     return _server
 
 
@@ -103,9 +125,21 @@ def _get_service_connection(config: LdapConfig):
             user=config.bind_dn,
             password=config.bind_password,
             auto_bind=True,
+            receive_timeout=config.receive_timeout_seconds,
         )
         logger.info("[ldap] LDAP service bind established")
         return _service_conn
+
+
+def _drop_service_connection() -> None:
+    global _service_conn
+    with _lock:
+        if _service_conn is not None:
+            try:
+                _service_conn.unbind()
+            except Exception:
+                pass
+        _service_conn = None
 
 
 def _find_user_dn(config: LdapConfig, username: str) -> Optional[str]:
@@ -115,17 +149,26 @@ def _find_user_dn(config: LdapConfig, username: str) -> Optional[str]:
         return None
     safe_username = escape_filter_chars(normalized)
     search_filter = config.search_filter % safe_username
-    conn = _get_service_connection(config)
-    with _lock:
-        ok = conn.search(
-            search_base=config.search_base,
-            search_filter=search_filter,
-            search_scope=SUBTREE,
-            attributes=["cn"],
-        )
-        if not ok or not conn.entries:
-            return None
-        return conn.entries[0].entry_dn
+    # Retry once when an existing service connection goes stale.
+    for attempt in (1, 2):
+        conn = _get_service_connection(config)
+        try:
+            with _lock:
+                ok = conn.search(
+                    search_base=config.search_base,
+                    search_filter=search_filter,
+                    search_scope=SUBTREE,
+                    attributes=["cn"],
+                )
+                if not ok or not conn.entries:
+                    return None
+                return conn.entries[0].entry_dn
+        except Exception as exc:
+            logger.warning("[ldap] service search failed on attempt %s: %s", attempt, exc)
+            _drop_service_connection()
+            if attempt == 2:
+                raise RuntimeError("LDAP service search failed") from exc
+    return None
 
 
 def authenticate(username: str, password: str) -> bool:
@@ -140,7 +183,13 @@ def authenticate(username: str, password: str) -> bool:
     _, Connection, _, _ = _ldap3_imports()
     server = _get_server(config)
     try:
-        user_conn = Connection(server, user=dn, password=password, auto_bind=True)
+        user_conn = Connection(
+            server,
+            user=dn,
+            password=password,
+            auto_bind=True,
+            receive_timeout=config.receive_timeout_seconds,
+        )
         user_conn.unbind()
         return True
     except Exception:
