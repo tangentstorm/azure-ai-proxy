@@ -60,6 +60,25 @@ def _ldap3_receive_timeout(value: float) -> int:
     return max(1, int(value))
 
 
+def _bind_connection(server, user: str, password: str, receive_timeout: int):
+    _, Connection, _, _ = _ldap3_imports()
+    conn = Connection(
+        server,
+        user=user,
+        password=password,
+        auto_bind=False,
+        receive_timeout=receive_timeout,
+    )
+    conn.open(read_server_info=False)
+    if not conn.bind(read_server_info=False):
+        try:
+            conn.unbind()
+        except Exception:
+            pass
+        raise RuntimeError(conn.last_error or "LDAP bind failed")
+    return conn
+
+
 def _parse_server_uri(server_uri: str) -> Tuple[str, Optional[int], bool]:
     parsed = urlparse(server_uri)
     # Accept full URIs (ldap://host:389, ldaps://host:636) and bare host[:port].
@@ -177,15 +196,13 @@ def _get_service_connection(config: LdapConfig):
     with _lock:
         if _service_conn is not None and _service_conn.bound:
             return _service_conn
-        _, Connection, _, _ = _ldap3_imports()
         server = _get_server(config)
         receive_timeout = _ldap3_receive_timeout(config.receive_timeout_seconds)
         logger.info("[ldap] connecting to LDAP server for service bind...")
-        _service_conn = Connection(
-            server,
+        _service_conn = _bind_connection(
+            server=server,
             user=config.bind_dn,
             password=config.bind_password,
-            auto_bind=True,
             receive_timeout=receive_timeout,
         )
         logger.info("[ldap] LDAP service bind established")
@@ -241,15 +258,13 @@ def authenticate(username: str, password: str) -> bool:
     dn = _find_user_dn(config, username)
     if not dn:
         return False
-    _, Connection, _, _ = _ldap3_imports()
     server = _get_server(config)
     receive_timeout = _ldap3_receive_timeout(config.receive_timeout_seconds)
     try:
-        user_conn = Connection(
-            server,
+        user_conn = _bind_connection(
+            server=server,
             user=dn,
             password=password,
-            auto_bind=True,
             receive_timeout=receive_timeout,
         )
         user_conn.unbind()
