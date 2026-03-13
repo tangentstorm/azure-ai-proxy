@@ -3,6 +3,7 @@ import os
 import threading
 from dataclasses import dataclass
 from typing import Optional, Tuple, Any
+from urllib.parse import urlparse
 
 logger = logging.getLogger("proxy")
 
@@ -27,6 +28,9 @@ def _ldap3_imports() -> Tuple[Any, Any, Any, Any]:
 @dataclass(frozen=True)
 class LdapConfig:
     server_uri: str
+    server_host: str
+    server_port: Optional[int]
+    server_use_ssl: bool
     bind_dn: str
     bind_password: str
     search_base: str
@@ -34,6 +38,7 @@ class LdapConfig:
     domain: Optional[str]
     connect_timeout_seconds: float
     receive_timeout_seconds: float
+    ip_mode: str
 
 
 def _load_timeout_env(name: str, default: float) -> float:
@@ -49,6 +54,50 @@ def _load_timeout_env(name: str, default: float) -> float:
     return value
 
 
+def _ldap3_receive_timeout(value: float) -> int:
+    # ldap3 2.9.1 eventually packs this into a native timeval struct and
+    # raises struct.error if given a float.
+    return max(1, int(value))
+
+
+def _parse_server_uri(server_uri: str) -> Tuple[str, Optional[int], bool]:
+    parsed = urlparse(server_uri)
+    # Accept full URIs (ldap://host:389, ldaps://host:636) and bare host[:port].
+    if parsed.scheme:
+        if parsed.scheme not in {"ldap", "ldaps"}:
+            raise RuntimeError("LDAP_SERVER must use ldap:// or ldaps://")
+        if not parsed.hostname:
+            raise RuntimeError("LDAP_SERVER must include a hostname")
+        use_ssl = parsed.scheme == "ldaps"
+        default_port = 636 if use_ssl else 389
+        return parsed.hostname, parsed.port or default_port, use_ssl
+    if ":" in server_uri:
+        host, port_text = server_uri.rsplit(":", 1)
+        if not host:
+            raise RuntimeError("LDAP_SERVER hostname is empty")
+        try:
+            return host, int(port_text), False
+        except ValueError as exc:
+            raise RuntimeError("LDAP_SERVER port must be an integer") from exc
+    return server_uri, None, False
+
+
+def _load_ip_mode() -> str:
+    value = os.getenv("LDAP_IP_MODE", "v4_only").strip().lower()
+    mapping = {
+        "v4_only": "IP_V4_ONLY",
+        "v4_preferred": "IP_V4_PREFERRED",
+        "v6_only": "IP_V6_ONLY",
+        "v6_preferred": "IP_V6_PREFERRED",
+    }
+    mode = mapping.get(value)
+    if not mode:
+        raise RuntimeError(
+            "LDAP_IP_MODE must be one of: v4_only, v4_preferred, v6_only, v6_preferred"
+        )
+    return mode
+
+
 def _load_config() -> LdapConfig:
     server_uri = os.getenv("LDAP_SERVER", "").strip()
     bind_dn = os.getenv("LDAP_DN", "").strip()
@@ -60,6 +109,8 @@ def _load_config() -> LdapConfig:
     domain = os.getenv("LDAP_DOMAIN", "").strip() or None
     connect_timeout_seconds = _load_timeout_env("LDAP_CONNECT_TIMEOUT_SECONDS", 5.0)
     receive_timeout_seconds = _load_timeout_env("LDAP_RECEIVE_TIMEOUT_SECONDS", 10.0)
+    server_host, server_port, server_use_ssl = _parse_server_uri(server_uri)
+    ip_mode = _load_ip_mode()
 
     missing = [
         name
@@ -77,6 +128,9 @@ def _load_config() -> LdapConfig:
         raise RuntimeError("LDAP_FILTER must contain a %s placeholder for the username")
     return LdapConfig(
         server_uri=server_uri,
+        server_host=server_host,
+        server_port=server_port,
+        server_use_ssl=server_use_ssl,
         bind_dn=bind_dn,
         bind_password=bind_password,
         search_base=search_base,
@@ -84,6 +138,7 @@ def _load_config() -> LdapConfig:
         domain=domain,
         connect_timeout_seconds=connect_timeout_seconds,
         receive_timeout_seconds=receive_timeout_seconds,
+        ip_mode=ip_mode,
     )
 
 
@@ -103,9 +158,14 @@ def _get_server(config: LdapConfig):
     global _server
     if _server is None:
         Server, _, _, _ = _ldap3_imports()
+        import ldap3
+
         _server = Server(
-            config.server_uri,
+            config.server_host,
+            port=config.server_port,
+            use_ssl=config.server_use_ssl,
             connect_timeout=config.connect_timeout_seconds,
+            mode=getattr(ldap3, config.ip_mode),
         )
     return _server
 
@@ -119,13 +179,14 @@ def _get_service_connection(config: LdapConfig):
             return _service_conn
         _, Connection, _, _ = _ldap3_imports()
         server = _get_server(config)
+        receive_timeout = _ldap3_receive_timeout(config.receive_timeout_seconds)
         logger.info("[ldap] connecting to LDAP server for service bind...")
         _service_conn = Connection(
             server,
             user=config.bind_dn,
             password=config.bind_password,
             auto_bind=True,
-            receive_timeout=config.receive_timeout_seconds,
+            receive_timeout=receive_timeout,
         )
         logger.info("[ldap] LDAP service bind established")
         return _service_conn
@@ -182,13 +243,14 @@ def authenticate(username: str, password: str) -> bool:
         return False
     _, Connection, _, _ = _ldap3_imports()
     server = _get_server(config)
+    receive_timeout = _ldap3_receive_timeout(config.receive_timeout_seconds)
     try:
         user_conn = Connection(
             server,
             user=dn,
             password=password,
             auto_bind=True,
-            receive_timeout=config.receive_timeout_seconds,
+            receive_timeout=receive_timeout,
         )
         user_conn.unbind()
         return True
