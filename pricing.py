@@ -4,6 +4,9 @@ import re
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+ROOT_DIR = Path(__file__).resolve().parent
+BUNDLED_MODEL_PRICING_FILE = ROOT_DIR / "data" / "model_pricing.azure.json"
+
 DEFAULT_MODEL_PRICING: Dict[str, Dict[str, float]] = {
     # Dollars per 1K tokens (input/output). Override for your upstream as needed.
     "gpt-4o": {"input": 0.005, "output": 0.015},
@@ -41,14 +44,26 @@ def parse_pricing_payload(payload: Dict[str, Any]) -> Dict[str, Dict[str, float]
     return parsed
 
 
+def resolve_pricing_file(path: str) -> Path:
+    candidate = Path(path).expanduser()
+    if candidate.is_absolute() or candidate.exists():
+        return candidate
+
+    repo_relative = ROOT_DIR / candidate
+    if repo_relative.exists():
+        return repo_relative
+    return candidate
+
+
 def load_pricing_file(path: str) -> Dict[str, Dict[str, float]]:
-    raw = Path(path).read_text()
+    resolved = resolve_pricing_file(path)
+    raw = resolved.read_text()
     try:
         payload = json.loads(raw)
     except json.JSONDecodeError as exc:
-        raise RuntimeError(f"MODEL_PRICING_FILE is not valid JSON: {path}") from exc
+        raise RuntimeError(f"MODEL_PRICING_FILE is not valid JSON: {resolved}") from exc
     if not isinstance(payload, dict):
-        raise RuntimeError(f"MODEL_PRICING_FILE must contain a JSON object: {path}")
+        raise RuntimeError(f"MODEL_PRICING_FILE must contain a JSON object: {resolved}")
     return parse_pricing_payload(payload)
 
 
@@ -70,6 +85,8 @@ def load_model_pricing(
 
     if env_pricing_file:
         layers.append(load_pricing_file(env_pricing_file))
+    elif BUNDLED_MODEL_PRICING_FILE.exists():
+        layers.append(load_pricing_file(str(BUNDLED_MODEL_PRICING_FILE)))
 
     return merge_pricing_layers(*layers)
 
