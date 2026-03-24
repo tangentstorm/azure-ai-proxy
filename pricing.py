@@ -15,7 +15,7 @@ DEFAULT_MODEL_PRICING: Dict[str, Dict[str, float]] = {
 }
 
 MODEL_VERSION_SUFFIX_RE = re.compile(
-    r"-(\d{4}-\d{2}-\d{2})(?:-[a-z0-9]+)?$",
+    r"-(\d{4}-\d{2}-\d{2})(?:-[a-z0-9]+)*$",
     re.IGNORECASE,
 )
 
