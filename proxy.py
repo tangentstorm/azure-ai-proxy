@@ -52,6 +52,79 @@ _last_mapping_error: Optional[str] = None
 router = APIRouter()
 
 
+def normalize_usage(usage: Dict[str, Any]) -> Dict[str, int]:
+    """Normalize usage payloads across chat/responses shapes."""
+    prompt = usage.get("prompt_tokens")
+    if prompt is None:
+        prompt = usage.get("input_tokens")
+
+    completion = usage.get("completion_tokens")
+    if completion is None:
+        completion = usage.get("output_tokens")
+
+    total = usage.get("total_tokens")
+    if total is None:
+        total = usage.get("tokens")
+
+    prompt_i = int(prompt or 0)
+    completion_i = int(completion or 0)
+    total_i = int(total or (prompt_i + completion_i))
+    return {
+        "prompt_tokens": prompt_i,
+        "completion_tokens": completion_i,
+        "total_tokens": total_i,
+    }
+
+
+def _usage_score(usage: Dict[str, Any]) -> int:
+    """Prefer the most complete usage dict when scanning nested payloads."""
+    score = 0
+    if usage.get("prompt_tokens") or usage.get("input_tokens"):
+        score += 1
+    if usage.get("completion_tokens") or usage.get("output_tokens"):
+        score += 1
+    if usage.get("total_tokens"):
+        score += 2
+    return score
+
+
+def extract_usage_and_model(payload: Any) -> Tuple[Optional[str], Optional[Dict[str, int]]]:
+    """
+    Recursively scan response payloads/events for model + usage.
+    Handles nested Responses API event shapes and classic chat/completions payloads.
+    """
+    model: Optional[str] = None
+    best_usage_raw: Optional[Dict[str, Any]] = None
+    best_usage_score = -1
+
+    stack = [payload]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, dict):
+            model_value = node.get("model")
+            if model_value and not model:
+                model = str(model_value)
+
+            usage_value = node.get("usage")
+            if isinstance(usage_value, dict):
+                score = _usage_score(usage_value)
+                if score > best_usage_score:
+                    best_usage_raw = usage_value
+                    best_usage_score = score
+
+            for value in node.values():
+                if isinstance(value, (dict, list)):
+                    stack.append(value)
+        elif isinstance(node, list):
+            for item in node:
+                if isinstance(item, (dict, list)):
+                    stack.append(item)
+
+    if not best_usage_raw:
+        return model, None
+    return model, normalize_usage(best_usage_raw)
+
+
 async def authenticate_client(
     authorization: Optional[str] = Header(None),
 ) -> Row:
@@ -313,9 +386,13 @@ async def proxy(
                         if data and data != "[DONE]":
                             try:
                                 payload = json.loads(data)
-                                model_seen = payload.get("model") or model_seen
-                                if payload.get("usage"):
-                                    usage_seen = payload["usage"]
+                                model_candidate, usage_candidate = extract_usage_and_model(
+                                    payload
+                                )
+                                if model_candidate:
+                                    model_seen = model_candidate
+                                if usage_candidate:
+                                    usage_seen = usage_candidate
                             except json.JSONDecodeError:
                                 pass
                     yield (line + "\n").encode("utf-8")
@@ -326,6 +403,8 @@ async def proxy(
             finally:
                 await stream_ctx.__aexit__(None, None, None)
                 await client.aclose()
+                if not model_seen and json_payload and json_payload.get("model"):
+                    model_seen = str(json_payload.get("model"))
                 if usage_seen and model_seen:
                     store_usage(
                         client_key["token"],
@@ -334,6 +413,8 @@ async def proxy(
                         usage_seen,
                         MODEL_PRICING,
                     )
+                elif usage_seen:
+                    logger.warning("[usage] stream usage seen but model missing")
 
         return StreamingResponse(
             stream_iter(),
@@ -377,16 +458,20 @@ async def proxy(
                 else:
                     _last_upstream_response = {"_raw": payload}
                 _last_mapping_error = None
-            if payload and payload.get("usage"):
-                model = payload.get("model") or payload.get("data", {}).get("model")
+            model, usage = extract_usage_and_model(payload)
+            if usage:
+                if not model and json_payload and json_payload.get("model"):
+                    model = str(json_payload.get("model"))
                 if model:
                     store_usage(
                         client_key["token"],
                         client_key["label"],
                         model,
-                        payload["usage"],
+                        usage,
                         MODEL_PRICING,
                     )
+                else:
+                    logger.warning("[usage] non-stream usage seen but model missing")
         except Exception as exc:
             logger.exception("[debug] response inspection failed: %s", repr(exc))
             with _debug_lock:
