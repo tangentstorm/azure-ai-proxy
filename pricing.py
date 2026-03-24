@@ -95,8 +95,16 @@ def calculate_usage_cost(
     usage: Dict[str, Any],
     pricing: Dict[str, Dict[str, float]],
 ) -> Optional[float]:
-    prompt = int(usage.get("prompt_tokens") or 0)
-    completion = int(usage.get("completion_tokens") or 0)
+    prompt = float(usage.get("prompt_tokens") or 0)
+    completion = float(usage.get("completion_tokens") or 0)
+    total = float(usage.get("total_tokens") or (prompt + completion))
+
+    # Some providers return only total tokens. Use a fixed 20/80 split for
+    # cost attribution when prompt/completion counts are both missing.
+    if prompt == 0 and completion == 0 and total > 0:
+        prompt = total * 0.2
+        completion = total * 0.8
+
     price = lookup_model_pricing(pricing, model)
     if not price:
         return None
