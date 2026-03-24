@@ -5,6 +5,8 @@ import uuid
 from contextlib import contextmanager
 from typing import Any, Dict, Optional
 
+from pricing import calculate_usage_cost
+
 Row = sqlite3.Row
 
 DATABASE_PATH = os.getenv("DATABASE_PATH", "./data/proxy.sqlite")
@@ -70,12 +72,15 @@ def store_usage(
     prompt = int(usage.get("prompt_tokens") or 0)
     completion = int(usage.get("completion_tokens") or 0)
     total = int(usage.get("total_tokens") or prompt + completion)
-    price = pricing.get(model, {})
-    cost = None
-    if price:
-        cost = (prompt / 1000) * price.get("input", 0) + (completion / 1000) * price.get(
-            "output", 0
-        )
+    cost = calculate_usage_cost(
+        model,
+        {
+            "prompt_tokens": prompt,
+            "completion_tokens": completion,
+            "total_tokens": total,
+        },
+        pricing,
+    )
 
     with get_db() as conn:
         conn.execute(

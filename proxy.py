@@ -2,7 +2,6 @@ import asyncio
 import json
 import logging
 import os
-import re
 import time
 from threading import Lock
 from typing import Any, Dict, Optional, Tuple
@@ -11,6 +10,7 @@ import httpx
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from fastapi.responses import Response, StreamingResponse
 
+from pricing import MODEL_PRICING, simplify_model_name
 from tracking import Row, get_active_key, store_usage
 
 logger = logging.getLogger("proxy")
@@ -20,24 +20,9 @@ UPSTREAM_BASE = os.getenv("UPSTREAM_BASE", "https://api.openai.com")
 UPSTREAM_API_KEY = os.getenv("UPSTREAM_API_KEY")
 UPSTREAM_API_VERSION = os.getenv("UPSTREAM_API_VERSION")  # Optional upstream API version
 
-DEFAULT_MODEL_PRICING: Dict[str, Dict[str, float]] = {
-    # Dollars per 1K tokens (input/output). Adjust as needed for your upstream.
-    "gpt-4o": {"input": 0.005, "output": 0.015},
-    "gpt-4o-mini": {"input": 0.00015, "output": 0.0006},
-    "gpt-3.5-turbo": {"input": 0.0015, "output": 0.002},
-}
-
-MODEL_PRICING: Dict[str, Dict[str, float]] = DEFAULT_MODEL_PRICING
-if os.getenv("MODEL_PRICING_JSON"):
-    try:
-        MODEL_PRICING = json.loads(os.environ["MODEL_PRICING_JSON"])
-    except json.JSONDecodeError:
-        raise RuntimeError("MODEL_PRICING_JSON is not valid JSON")
-
 if not UPSTREAM_API_KEY:
     raise RuntimeError("UPSTREAM_API_KEY is required")
 
-MODEL_SUFFIX_RE = re.compile(r"-(\\d{4}-\\d{2}-\\d{2})(?:-[a-z0-9]+)?$", re.IGNORECASE)
 _models_lock = Lock()
 _models_simplified: list[str] = []
 _models_map: Dict[str, str] = {}
@@ -159,36 +144,39 @@ def normalize_base(raw_base: str) -> str:
     return raw_base.split("?", 1)[0].rstrip("/")
 
 
-def simplify_model_name(model: str) -> str:
-    model = model.strip()
-    match = MODEL_SUFFIX_RE.search(model)
-    if match:
-        return model[: match.start()]
-    return model
-
-
 def build_model_mapping(models: list[str]) -> tuple[list[str], Dict[str, str]]:
-    simplified_map: Dict[str, str] = {}
-    collisions: set[str] = set()
-    for real in models:
-        simplified = simplify_model_name(real)
-        if simplified in simplified_map and simplified_map[simplified] != real:
-            collisions.add(simplified)
-        else:
-            simplified_map[simplified] = real
-
     mapping: Dict[str, str] = {real: real for real in models}
     display: list[str] = []
+    grouped: Dict[str, list[str]] = {}
     for real in models:
-        simplified = simplify_model_name(real)
-        if simplified in collisions:
-            display.append(real)
-            continue
-        if simplified != real:
-            mapping[simplified] = real
+        grouped.setdefault(simplify_model_name(real), []).append(real)
+
+    for simplified, real_models in grouped.items():
+        unique_models = sorted(set(real_models))
+
+        # Azure's /models endpoint returns model versions, but requests still
+        # need the stable deployment name. Collapse a single-version family to
+        # the simplified deployment alias.
+        if simplified in unique_models:
+            canonical = simplified
+            mapping[simplified] = canonical
+            for real in unique_models:
+                mapping[real] = canonical
             display.append(simplified)
-        else:
-            display.append(real)
+            continue
+
+        if len(unique_models) == 1:
+            canonical = simplified
+            real = unique_models[0]
+            if simplified != real:
+                mapping[simplified] = canonical
+                mapping[real] = canonical
+                display.append(simplified)
+            else:
+                display.append(real)
+            continue
+
+        display.extend(unique_models)
 
     return sorted(set(display)), mapping
 

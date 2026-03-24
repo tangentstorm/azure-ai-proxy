@@ -18,6 +18,7 @@ export UPSTREAM_API_VERSION=2024-02-15-preview # optional upstream API version
 export ADMIN_TOKEN=supersecret        # required to create/revoke keys
 export DATABASE_PATH=./data/proxy.sqlite     # optional
 export PROXY_LOG_PATH=./data/proxy.log      # optional: server log file
+export MODEL_PRICING_FILE=./data/model_pricing.azure.json # optional: pricing map file
 ```
 Environment files: `.env.local` (preferred) and `.env` are loaded automatically.
 3) Run the proxy:
@@ -78,10 +79,42 @@ The proxy forwards `/v1/<path>` to `UPSTREAM_BASE/<path>` with no other path rew
 ## How metering works
 
 - Each issued token maps to a label (e.g., username). Requests authenticated with that token are proxied with the shared upstream key.
-- Usage rows are recorded whenever upstream responses include `usage` (tokens and model). Costs are calculated if the model exists in `MODEL_PRICING_JSON` or the built-in defaults.
-- The cost model is simple dollars per 1K tokens (input/output). Override pricing with `MODEL_PRICING_JSON` containing a JSON object like:
+- Usage rows are recorded whenever upstream responses include `usage` (tokens and model). Costs are calculated if the model exists in `MODEL_PRICING_FILE` or the built-in defaults.
+- The cost model is simple dollars per 1K tokens (input/output). Override pricing with `MODEL_PRICING_FILE` pointing at a JSON object shaped like `{model:{input,output}}`.
+
+### Azure pricing collection
+
+Generate a pricing file from Azure retail pricing meters (region-scoped):
 ```
-export MODEL_PRICING_JSON='{"gpt-4o":{"input":0.005,"output":0.015}}'
+python scripts/fetch_azure_pricing.py \
+  --region eastus2 \
+  --output ./data/azure_pricing_report.json \
+  --emit-model-pricing-json ./data/model_pricing.azure.json
+```
+Notes:
+- The report includes `resolved_pricing` and `unresolved` models; unresolved ones need manual review.
+- The emitted JSON is compatible with `MODEL_PRICING_FILE`.
+
+### Backfill / repricing
+
+Recompute historical `usage.cost` with date/model filters (dry-run by default):
+```
+python scripts/reprice_usage.py \
+  --database ./data/proxy.sqlite \
+  --pricing-file ./data/model_pricing.azure.json \
+  --start-date 2026-03-01 \
+  --end-date 2026-03-24 \
+  --model gpt-5.2-codex
+```
+
+Apply changes:
+```
+python scripts/reprice_usage.py \
+  --database ./data/proxy.sqlite \
+  --pricing-file ./data/model_pricing.azure.json \
+  --start-date 2026-03-01 \
+  --end-date 2026-03-24 \
+  --apply
 ```
 
 ## Reports
