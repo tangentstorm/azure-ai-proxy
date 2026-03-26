@@ -21,12 +21,17 @@ export PROXY_LOG_PATH=./data/proxy.log      # optional: server log file
 export MODEL_PRICING_FILE=./data/model_pricing.azure.json # optional: pricing map file
 ```
 Environment files: `.env.local` (preferred) and `.env` are loaded automatically.
-3) Run the proxy:
+3) Apply schema migrations:
+```
+python scripts/migrate.py --database ./data/proxy.sqlite
+```
+The app expects the database to already be at the current schema version and will fail fast on startup if it is not.
+4) Run the proxy:
 ```
 uvicorn app:app --reload --port 8000
 ```
-4) Sign in locally:
-Visit `http://localhost:8000/login` and enter a username (no password). This sets a `proxy_username` cookie for browsing the UI.
+5) Sign in locally:
+Visit `http://localhost:8000/login` and enter a username (no password). This sets an opaque `proxy_session` cookie for browsing the UI. Active sessions slide forward for 7 days on each authenticated UI request, and `POST /logout` revokes the current session.
 
 ## Managing keys
 
@@ -50,14 +55,16 @@ curl http://localhost:8000/admin/usage/<token> \
 
 ### Self-service UI (intranet)
 
-- Visit `http://localhost:8000/request-key` to request keys without admin auth. Provide your username and a note; a UUID-hex key will be issued and shown once. The page also lists your existing active keys with only the first/last 4 characters visible.
+- Visit `http://localhost:8000/request-key` to request keys for the currently signed-in user. A UUID-hex key will be issued and shown once. The page also lists your existing active keys with only the first/last 4 characters visible.
 - API equivalents:
 ```
 curl -X POST http://localhost:8000/public/keys \
+  -b "proxy_session=<session-token>" \
   -H "Content-Type: application/json" \
-  -d '{"username":"alice","note":"team tool"}'
+  -d '{"note":"team tool"}'
 
-curl http://localhost:8000/public/keys/alice
+curl -b "proxy_session=<session-token>" \
+  http://localhost:8000/public/keys/alice
 ```
 
 ## Using the proxy
@@ -78,7 +85,7 @@ The proxy forwards `/v1/<path>` to `UPSTREAM_BASE/<path>` with no other path rew
 
 ## How metering works
 
-- Each issued token maps to a label (e.g., username). Requests authenticated with that token are proxied with the shared upstream key.
+- Each issued token belongs to a user row. Requests authenticated with that token are proxied with the shared upstream key.
 - Usage rows are recorded whenever upstream responses include `usage` (tokens and model). Costs are calculated if the model exists in `MODEL_PRICING_FILE` or the built-in defaults.
 - The cost model is simple dollars per 1K tokens (input/output). Override pricing with `MODEL_PRICING_FILE` pointing at a JSON object shaped like `{model:{input,output}}`.
 

@@ -66,7 +66,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--label",
         action="append",
         default=[],
-        help="Only reprice this label (repeatable).",
+        help="Only reprice this username (repeatable).",
+    )
+    parser.add_argument(
+        "--username",
+        action="append",
+        default=[],
+        help="Alias for --label.",
     )
     parser.add_argument(
         "--only-null-cost",
@@ -128,9 +134,10 @@ def main() -> int:
     if args.model:
         where.append(f"model IN ({','.join(['?'] * len(args.model))})")
         params.extend(args.model)
-    if args.label:
-        where.append(f"label IN ({','.join(['?'] * len(args.label))})")
-        params.extend(args.label)
+    usernames = args.label + args.username
+    if usernames:
+        where.append(f"usr.username IN ({','.join(['?'] * len(usernames))})")
+        params.extend(usernames)
     if args.only_null_cost:
         where.append("cost IS NULL")
 
@@ -148,10 +155,12 @@ def main() -> int:
     try:
         rows = conn.execute(
             f"""
-            SELECT id, model, prompt_tokens, completion_tokens, total_tokens, cost, created_at
-            FROM usage
+            SELECT u.id, u.model, u.prompt_tokens, u.completion_tokens, u.total_tokens, u.cost, u.created_at
+            FROM usage u
+            JOIN api_keys k ON k.id = u.token_id
+            JOIN users usr ON usr.id = k.user_id
             {where_sql}
-            ORDER BY id
+            ORDER BY u.id
             {limit_sql}
             """,
             params,
@@ -206,7 +215,7 @@ def main() -> int:
                 "start_ts": start_ts,
                 "end_ts": end_ts,
                 "models": args.model,
-                "labels": args.label,
+                "labels": usernames,
                 "only_null_cost": args.only_null_cost,
                 "clear_unpriced": args.clear_unpriced,
                 "limit": args.limit,

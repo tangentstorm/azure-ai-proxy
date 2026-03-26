@@ -395,8 +395,7 @@ async def proxy(
                     model_seen = str(json_payload.get("model"))
                 if usage_seen and model_seen:
                     store_usage(
-                        client_key["token"],
-                        client_key["label"],
+                        client_key["token_id"],
                         model_seen,
                         usage_seen,
                         MODEL_PRICING,
@@ -452,8 +451,7 @@ async def proxy(
                     model = str(json_payload.get("model"))
                 if model:
                     store_usage(
-                        client_key["token"],
-                        client_key["label"],
+                        client_key["token_id"],
                         model,
                         usage,
                         MODEL_PRICING,

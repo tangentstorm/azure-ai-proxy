@@ -39,14 +39,21 @@ logger.info(
 
 import ldap_plugin  # noqa: E402
 
+from db_schema import ensure_expected_schema  # noqa: E402
+from identity import canonicalize_username  # noqa: E402
 from tracking import (  # noqa: E402
+    DATABASE_PATH,
+    SESSION_TTL_SECONDS,
     create_api_key,
+    create_session,
     fetch_active_keys_for_label,
     fetch_cost_by_day,
     fetch_cost_by_user,
     fetch_stacked_costs,
     fetch_usage_summary,
+    get_active_session,
     init_db,
+    revoke_session,
     revoke_key,
 )
 
@@ -59,6 +66,7 @@ from proxy import (  # noqa: E402
 )
 
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN")  # Simple shared secret for managing keys
+SESSION_COOKIE_NAME = "proxy_session"
 
 
 def require_admin(admin_token: str):
@@ -68,19 +76,6 @@ def require_admin(admin_token: str):
         )
     if admin_token != ADMIN_TOKEN:
         raise HTTPException(status_code=401, detail="Invalid admin token")
-
-
-def canonicalize_username(value: str) -> str:
-    value = (value or "").strip()
-    if not value:
-        return ""
-    if "@" not in value:
-        return value
-    local_part, _domain = value.split("@", 1)
-    return local_part.strip()
-
-
-
 
 
 app = FastAPI(title="OpenAI Proxy")
@@ -118,27 +113,45 @@ def parse_date_range(start: Optional[str], end: Optional[str]) -> Tuple[int, int
     return int(start_dt.timestamp()), int(end_dt.timestamp())
 
 
-def resolve_username(request: Request) -> str:
-    """
-    Resolve the caller's username from headers set by an upstream auth proxy.
-    Falls back to a cookie if present.
-    """
-    header_candidates = [
-        "x-user",
-        "x-forwarded-user",
-        "x-remote-user",
-        "remote-user",
-    ]
-    for h in header_candidates:
-        if h in request.headers and request.headers[h].strip():
-            return canonicalize_username(request.headers[h])
-    cookie_user = request.cookies.get("proxy_username")
-    if cookie_user:
-        return canonicalize_username(cookie_user)
-    raise HTTPException(
-        status_code=401,
-        detail="User identity not found in headers/cookie; login required",
+def request_is_secure(request: Request) -> bool:
+    forwarded_proto = request.headers.get("x-forwarded-proto", "")
+    if forwarded_proto:
+        return forwarded_proto.split(",", 1)[0].strip().lower() == "https"
+    return request.url.scheme == "https"
+
+
+def set_session_cookie(response: RedirectResponse, request: Request, session_token: str) -> None:
+    response.set_cookie(
+        key=SESSION_COOKIE_NAME,
+        value=session_token,
+        max_age=SESSION_TTL_SECONDS,
+        httponly=True,
+        samesite="lax",
+        secure=request_is_secure(request),
     )
+    response.delete_cookie("proxy_username")
+
+
+def clear_session_cookie(response: RedirectResponse, request: Request) -> None:
+    response.delete_cookie(
+        key=SESSION_COOKIE_NAME,
+        httponly=True,
+        samesite="lax",
+        secure=request_is_secure(request),
+    )
+    response.delete_cookie("proxy_username")
+
+
+def resolve_session(request: Request):
+    session_token = request.cookies.get(SESSION_COOKIE_NAME)
+    session = get_active_session(session_token or "")
+    if session:
+        return session
+    raise HTTPException(status_code=401, detail="Login required")
+
+
+def resolve_username(request: Request) -> str:
+    return str(resolve_session(request)["username"])
 
 
 def require_username(request: Request) -> str:
@@ -152,8 +165,8 @@ def build_login_html(
     if error_message:
         error_block = f'<div class="error">{html.escape(error_message)}</div>'
     password_block = ""
-    login_copy = "No passwords yet. Enter a username to set your session cookie."
-    login_hint = "We set a cookie named <code>proxy_username</code> for local navigation."
+    login_copy = "No passwords yet. Enter a username to start a signed-in session."
+    login_hint = "We store an opaque <code>proxy_session</code> cookie for local navigation."
     if ldap_enabled:
         login_copy = "Use your LDAP username and password to sign in."
         login_hint = "Credentials are verified against LDAP before setting your session."
@@ -287,6 +300,7 @@ def sanitized_next(target: Optional[str]) -> str:
 
 @app.on_event("startup")
 async def on_startup():
+    ensure_expected_schema(DATABASE_PATH)
     init_db()
     try:
         await refresh_models_cache()
@@ -313,7 +327,7 @@ async def debug_last_response(request: Request):
 async def login_page(request: Request, next: Optional[str] = "/"):
     target = sanitized_next(next)
     try:
-        resolve_username(request)
+        resolve_session(request)
         return RedirectResponse(url=target, status_code=302)
     except HTTPException:
         pass
@@ -323,6 +337,7 @@ async def login_page(request: Request, next: Optional[str] = "/"):
 
 @app.post("/login")
 async def login(
+    request: Request,
     username: str = Form(...),
     password: Optional[str] = Form(None),
     next: str = Form("/"),
@@ -357,14 +372,19 @@ async def login(
         except RuntimeError as exc:
             logger.exception("[ldap] authentication failed: %s", exc)
             raise HTTPException(status_code=500, detail=str(exc))
+    session_token = create_session(canonical_username)
     response = RedirectResponse(url=target, status_code=303)
-    response.set_cookie(
-        key="proxy_username",
-        value=canonical_username,
-        max_age=7 * 24 * 3600,
-        httponly=True,
-        samesite="lax",
-    )
+    set_session_cookie(response, request, session_token)
+    return response
+
+
+@app.post("/logout")
+async def logout(request: Request):
+    session_token = request.cookies.get(SESSION_COOKIE_NAME)
+    if session_token:
+        revoke_session(session_token)
+    response = RedirectResponse(url="/login", status_code=303)
+    clear_session_cookie(response, request)
     return response
 
 
@@ -443,6 +463,7 @@ async def root(request: Request):
     <div class="links">
       <a href="/request-key">Request or view keys</a>
       <a href="/reports">Cost reports</a>
+      <form method="POST" action="/logout"><button type="submit" style="width:100%; text-align:left; padding:14px 16px; border-radius:14px; border:1px solid rgba(255,255,255,0.08); background:rgba(255,255,255,0.04); color:#e2e8f0; font-weight:600; cursor:pointer;">Log out</button></form>
     </div>
   </div>
 </body>
@@ -527,23 +548,22 @@ async def reports_data(
 
 
 @app.post("/public/keys")
-async def public_issue_key(payload: Dict[str, str]):
-    username = canonicalize_username(payload.get("username") or "")
+async def public_issue_key(payload: Dict[str, str], request: Request):
+    username = require_username(request)
     note = (payload.get("note") or "").strip() or None
-    if not username:
-        raise HTTPException(status_code=400, detail="username is required")
     token = create_api_key(username, note=note)
     return {"token": token, "username": username, "note": note, "masked": mask_token(token)}
 
 
 @app.get("/public/keys/{username}")
-async def public_list_keys(username: str):
-    username = canonicalize_username(username)
-    if not username:
-        raise HTTPException(status_code=400, detail="username is required")
-    rows = fetch_active_keys_for_label(username)
+async def public_list_keys(username: str, request: Request):
+    current_username = require_username(request)
+    requested_username = canonicalize_username(username)
+    if requested_username and requested_username != current_username:
+        raise HTTPException(status_code=403, detail="Cannot list keys for another user")
+    rows = fetch_active_keys_for_label(current_username)
     return {
-        "username": username,
+        "username": current_username,
         "keys": [
             {
                 "token_masked": mask_token(r["token"]),
@@ -661,12 +681,14 @@ async def request_key_page(request: Request):
     }
     .nav { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:10px; }
     .pill-link { padding:6px 10px; border-radius:999px; background:rgba(255,255,255,0.06); border:1px solid var(--border); text-decoration:none; color:var(--text); font-size:13px; }
+    .logout-btn { padding:6px 10px; border-radius:999px; background:rgba(255,255,255,0.06); border:1px solid var(--border); color:var(--text); font-size:13px; cursor:pointer; }
   </style>
 </head>
 <body>
   <div class="card">
     <div class="nav">
       <a class="pill-link" href="/">Home</a>
+      <form method="POST" action="/logout" style="margin:0;"><button class="logout-btn" type="submit">Log out</button></form>
     </div>
     <h1>Get an API key</h1>
     <p>Signed in as <strong>__USERNAME__</strong>. Add a note about what you’re using the key for. New keys are UUID hex strings; keep them secret.</p>
@@ -828,6 +850,7 @@ async def reports_page(request: Request):
     <h1 style="margin:0;">Cost reports</h1>
     <span class="pill"><a href="/">Home</a></span>
     <span class="pill"><a href="/request-key">Request key</a></span>
+    <form method="POST" action="/logout" style="margin:0;"><button type="submit" style="padding:6px 10px; border-radius:999px; border:1px solid var(--border); background:rgba(255,255,255,0.06); color:var(--text); cursor:pointer;">Log out</button></form>
   </div>
   <p>View cost by user and over time. Adjust the date range (UTC). Charts render entirely in the browser.</p>
   <div class="controls">
