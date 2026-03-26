@@ -888,9 +888,22 @@ async def reports_page(request: Request):
       document.getElementById('end').value = end;
     }
 
-    function palette(i) {
-      const colors = ['#22d3ee','#a855f7','#f97316','#f43f5e','#10b981','#3b82f6','#8b5cf6','#f59e0b'];
-      return colors[i % colors.length];
+    const USER_COLORS = ['#22d3ee','#a855f7','#ef4444','#f59e0b','#10b981','#3b82f6','#f97316','#84cc16'];
+
+    function buildUserColorMap(data) {
+      const labels = new Set();
+      for (const row of (data.cost_by_user || [])) labels.add(row.label || '—');
+      for (const row of ((data.stacked && data.stacked.series) || [])) labels.add(row.label || '—');
+      const sorted = Array.from(labels).sort((a, b) => a.localeCompare(b));
+      const map = new Map();
+      for (let i = 0; i < sorted.length; i += 1) {
+        map.set(sorted[i], USER_COLORS[i % USER_COLORS.length]);
+      }
+      return map;
+    }
+
+    function colorForLabel(colorMap, label) {
+      return colorMap.get(label || '—') || USER_COLORS[0];
     }
 
     function fmtCurrency(value) {
@@ -908,7 +921,7 @@ async def reports_page(request: Request):
       return res.json();
     }
 
-    function renderCostByUser(data) {
+    function renderCostByUser(data, colorMap) {
       const labels = data.cost_by_user.map(d => d.label || '—');
       const values = data.cost_by_user.map(d => d.cost || 0);
       if (costChart) costChart.destroy();
@@ -919,7 +932,7 @@ async def reports_page(request: Request):
           datasets: [{
             label: 'Cost',
             data: values,
-            backgroundColor: labels.map((_,i)=>palette(i)),
+            backgroundColor: labels.map(label => colorForLabel(colorMap, label)),
           }]
         },
         options: { plugins: { tooltip: { callbacks: { label: ctx => fmtCurrency(ctx.parsed.y) } } }, scales: { y: { ticks: { callback: v => '$'+v } } } }
@@ -960,7 +973,7 @@ async def reports_page(request: Request):
       });
     }
 
-    function renderStacked(data) {
+    function renderStacked(data, colorMap) {
       const labels = data.stacked.days;
       const series = data.stacked.series;
       if (stackedChart) stackedChart.destroy();
@@ -968,10 +981,10 @@ async def reports_page(request: Request):
         type: 'bar',
         data: {
           labels,
-          datasets: series.map((s,i)=>({
+          datasets: series.map(s=>({
             label: s.label || '—',
             data: s.costs,
-            backgroundColor: palette(i),
+            backgroundColor: colorForLabel(colorMap, s.label),
             stack: 'users'
           }))
         },
@@ -989,9 +1002,10 @@ async def reports_page(request: Request):
       document.getElementById('period-label').textContent = 'Loading…';
       try {
         const data = await loadData();
-        renderCostByUser(data);
+        const colorMap = buildUserColorMap(data);
+        renderCostByUser(data, colorMap);
         renderTotalByDay(data);
-        renderStacked(data);
+        renderStacked(data, colorMap);
         const start = document.getElementById('start').value;
         const end = document.getElementById('end').value;
         document.getElementById('period-label').textContent = `${start} → ${end}`;
