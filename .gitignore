@@ -1,0 +1,6 @@
+__pycache__
+*~
+.env.local
+data/proxy.log
+data/proxy.sqlite
+data/azure_pricing_report.json
