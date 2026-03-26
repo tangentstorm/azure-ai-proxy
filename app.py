@@ -70,6 +70,16 @@ def require_admin(admin_token: str):
         raise HTTPException(status_code=401, detail="Invalid admin token")
 
 
+def canonicalize_username(value: str) -> str:
+    value = (value or "").strip()
+    if not value:
+        return ""
+    if "@" not in value:
+        return value
+    local_part, _domain = value.split("@", 1)
+    return local_part.strip()
+
+
 
 
 
@@ -121,10 +131,10 @@ def resolve_username(request: Request) -> str:
     ]
     for h in header_candidates:
         if h in request.headers and request.headers[h].strip():
-            return request.headers[h].strip()
+            return canonicalize_username(request.headers[h])
     cookie_user = request.cookies.get("proxy_username")
     if cookie_user:
-        return cookie_user
+        return canonicalize_username(cookie_user)
     raise HTTPException(
         status_code=401,
         detail="User identity not found in headers/cookie; login required",
@@ -320,6 +330,9 @@ async def login(
     username = (username or "").strip()
     if not username:
         raise HTTPException(status_code=400, detail="username is required")
+    canonical_username = canonicalize_username(username)
+    if not canonical_username:
+        raise HTTPException(status_code=400, detail="username is required")
     target = sanitized_next(next)
     ldap_enabled = ldap_plugin.ldap_enabled()
     if ldap_enabled:
@@ -347,7 +360,7 @@ async def login(
     response = RedirectResponse(url=target, status_code=303)
     response.set_cookie(
         key="proxy_username",
-        value=username,
+        value=canonical_username,
         max_age=7 * 24 * 3600,
         httponly=True,
         samesite="lax",
@@ -442,7 +455,7 @@ async def root(request: Request):
 @app.post("/admin/keys")
 async def issue_key(payload: Dict[str, str], x_admin_token: str = Header(...)):
     require_admin(x_admin_token)
-    label = payload.get("label") or "user"
+    label = canonicalize_username(payload.get("label") or "user")
     note = payload.get("note")
     token = create_api_key(label, note=note)
     return {"token": token, "label": label, "note": note}
@@ -515,7 +528,7 @@ async def reports_data(
 
 @app.post("/public/keys")
 async def public_issue_key(payload: Dict[str, str]):
-    username = (payload.get("username") or "").strip()
+    username = canonicalize_username(payload.get("username") or "")
     note = (payload.get("note") or "").strip() or None
     if not username:
         raise HTTPException(status_code=400, detail="username is required")
@@ -525,7 +538,7 @@ async def public_issue_key(payload: Dict[str, str]):
 
 @app.get("/public/keys/{username}")
 async def public_list_keys(username: str):
-    username = username.strip()
+    username = canonicalize_username(username)
     if not username:
         raise HTTPException(status_code=400, detail="username is required")
     rows = fetch_active_keys_for_label(username)
