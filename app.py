@@ -247,7 +247,7 @@ def build_login_html(
     <form method="POST" action="/login">
       <input type="hidden" name="next" value="__NEXT__" />
       <label for="username">Username</label>
-      <input id="username" name="username" placeholder="e.g. codex" autocomplete="username" required />
+      <input id="username" name="username" placeholder="e.g. first.last" autocomplete="username" required />
 __PASSWORD__
       <button type="submit">Continue</button>
       <p class="hint">__LOGIN_HINT__</p>
