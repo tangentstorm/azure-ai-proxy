@@ -47,9 +47,9 @@ from tracking import (  # noqa: E402
     create_api_key,
     create_session,
     fetch_active_keys_for_label,
-    fetch_cost_by_day,
-    fetch_cost_by_user,
-    fetch_stacked_costs,
+    fetch_report_rows,
+    fetch_report_summary,
+    fetch_report_users,
     fetch_usage_summary,
     get_active_session,
     init_db,
@@ -502,48 +502,51 @@ async def usage_for_token(token: str, x_admin_token: str = Header(...)):
 
 @app.get("/reports/data")
 async def reports_data(
-    start: Optional[str] = None, end: Optional[str] = None, request: Request = None
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+    scope: str = "all_users",
+    bucket: str = "day",
+    user: Optional[str] = None,
+    request: Request = None,
 ):
-    """
-    Aggregated cost data for charts. Date params are YYYY-MM-DD (inclusive start, inclusive end day).
-    """
     if request:
         require_username(request)
-    start_ts, end_ts = parse_date_range(start, end)
-    by_user = fetch_cost_by_user(start_ts, end_ts)
-    by_day = fetch_cost_by_day(start_ts, end_ts)
-    stacked = fetch_stacked_costs(start_ts, end_ts)
+    valid_scopes = {"all_users", "user", "key", "user_key"}
+    valid_buckets = {"all", "year", "month", "week", "day"}
+    if scope not in valid_scopes:
+        raise HTTPException(status_code=400, detail=f"Invalid scope '{scope}'")
+    if bucket not in valid_buckets:
+        raise HTTPException(status_code=400, detail=f"Invalid bucket '{bucket}'")
 
-    days = sorted({row["day"] for row in stacked})
-    labels = sorted({row["label"] for row in stacked})
-    cost_map = {(row["label"], row["day"]): row["cost"] for row in stacked}
-    stacked_series = [
-        {
-            "label": label,
-            "costs": [cost_map.get((label, day), 0) for day in days],
-        }
-        for label in labels
-    ]
+    if bucket == "all":
+        start_ts, end_ts = 0, 32503680000  # UTC 3000-01-01
+    else:
+        start_ts, end_ts = parse_date_range(start, end)
 
-    total_day_list = [dict(day=row["day"], cost=row["cost"]) for row in by_day]
-    cumulative = []
-    running = 0.0
-    for row in total_day_list:
-        running += row["cost"]
-        cumulative.append({"day": row["day"], "cost": running})
+    rows = fetch_report_rows(
+        start_ts=start_ts,
+        end_ts=end_ts,
+        bucket=bucket,
+        scope=scope,
+        username=user,
+    )
+    summary = fetch_report_summary(start_ts=start_ts, end_ts=end_ts, username=user)
 
     return {
+        "query": {
+            "scope": scope,
+            "bucket": bucket,
+            "user": user,
+            "start": start,
+            "end": end,
+        },
         "period": {
             "start": start_ts,
             "end": end_ts,
         },
-        "cost_by_user": [dict(label=row["label"], cost=row["cost"]) for row in by_user],
-        "total_by_day": total_day_list,
-        "cumulative": cumulative,
-        "stacked": {
-            "days": days,
-            "series": stacked_series,
-        },
+        "users": fetch_report_users(),
+        "rows": rows,
+        "summary": summary,
     }
 
 
@@ -807,215 +810,626 @@ async def reports_page(request: Request):
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Cost Reports</title>
+  <title>Usage Reports</title>
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
   <style>
     :root {
-      --bg: radial-gradient(circle at 10% 20%, #0f172a 0, #0a1224 30%, #050a16 70%, #020610 100%);
-      --panel: rgba(255, 255, 255, 0.06);
-      --border: rgba(255,255,255,0.08);
-      --text: #e2e8f0;
-      --muted: #94a3b8;
-      --accent: #22d3ee;
+      --bg: radial-gradient(circle at 12% 12%, #102341 0, #0a1830 30%, #081224 60%, #04080f 100%);
+      --panel: rgba(255,255,255,0.07);
+      --panel-strong: rgba(255,255,255,0.11);
+      --border: rgba(255,255,255,0.09);
+      --text: #e5ecf4;
+      --muted: #9aa9bd;
+      --accent: #38bdf8;
+      --accent-2: #fb7185;
+      --ok: #34d399;
+      --warn: #f59e0b;
+      --mono: "SFMono-Regular", ui-monospace, Menlo, Consolas, monospace;
     }
     * { box-sizing: border-box; }
     body {
       margin: 0;
       min-height: 100vh;
-      font-family: "Space Grotesk","Manrope","Soehne",system-ui,-apple-system,sans-serif;
       background: var(--bg);
       color: var(--text);
-      padding: 24px;
+      font-family: "Space Grotesk","Manrope","Soehne",system-ui,-apple-system,sans-serif;
+      padding: 22px;
     }
-    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 20px; }
+    .layout {
+      max-width: 1360px;
+      margin: 0 auto;
+      display: grid;
+      gap: 16px;
+    }
     .card {
       background: var(--panel);
       border: 1px solid var(--border);
-      border-radius: 18px;
-      padding: 16px;
-      box-shadow: 0 20px 60px rgba(0,0,0,0.45);
-      backdrop-filter: blur(12px);
+      border-radius: 16px;
+      padding: 14px;
+      box-shadow: 0 20px 55px rgba(0,0,0,0.35);
+      backdrop-filter: blur(10px);
     }
-    h1 { margin: 0 0 10px; letter-spacing: -0.02em; }
-    p { margin: 0 0 20px; color: var(--muted); }
-    label { font-weight: 600; margin-right: 8px; }
-    input { padding: 10px 12px; border-radius: 10px; border: 1px solid var(--border); background: rgba(255,255,255,0.05); color: var(--text); }
-    .controls { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 12px; }
-    .pill { padding: 6px 10px; border-radius: 999px; background: rgba(255,255,255,0.06); color: var(--muted); font-size: 13px; }
-    a { color: var(--accent); text-decoration: none; }
+    .top {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+    .top h1 { margin: 0; font-size: 26px; letter-spacing: -0.02em; }
+    .nav { display: flex; gap: 8px; flex-wrap: wrap; }
+    .pill-link, .logout-btn {
+      padding: 6px 10px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      background: rgba(255,255,255,0.07);
+      color: var(--text);
+      text-decoration: none;
+      font-size: 13px;
+      cursor: pointer;
+    }
+    .desc { margin: 8px 0 0 0; color: var(--muted); font-size: 14px; }
+    .control-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+      gap: 10px;
+    }
+    label {
+      display: block;
+      font-size: 12px;
+      color: var(--muted);
+      margin-bottom: 6px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+    select, input, button {
+      width: 100%;
+      padding: 10px 12px;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      background: rgba(255,255,255,0.05);
+      color: var(--text);
+      font-size: 14px;
+    }
+    button.primary {
+      background: linear-gradient(120deg, var(--accent), var(--accent-2));
+      border: none;
+      color: #0a1020;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    .range-pills {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin-top: 10px;
+    }
+    .range-pills button {
+      width: auto;
+      padding: 6px 10px;
+      border-radius: 999px;
+      font-size: 12px;
+      cursor: pointer;
+    }
+    .stats {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 10px;
+    }
+    .stat {
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 12px;
+      background: var(--panel-strong);
+    }
+    .stat .k {
+      color: var(--muted);
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      margin-bottom: 8px;
+      font-weight: 700;
+    }
+    .stat .v {
+      font-size: 22px;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+    }
+    .pill {
+      display: inline-block;
+      padding: 5px 10px;
+      border-radius: 999px;
+      background: rgba(255,255,255,0.08);
+      border: 1px solid var(--border);
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .viz-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+      gap: 14px;
+    }
+    .viz-wide { grid-column: 1 / -1; }
+    .title-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      margin-bottom: 8px;
+      flex-wrap: wrap;
+    }
+    .title-row h3 { margin: 0; }
+    .table-wrap { overflow: auto; max-height: 420px; }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+    }
+    th, td {
+      text-align: left;
+      padding: 9px 8px;
+      border-bottom: 1px solid rgba(255,255,255,0.08);
+      white-space: nowrap;
+    }
+    th { color: var(--muted); font-weight: 700; position: sticky; top: 0; background: rgba(6, 11, 20, 0.9); }
+    td.right { text-align: right; font-variant-numeric: tabular-nums; }
+    .status {
+      color: var(--muted);
+      font-size: 13px;
+      margin-top: 8px;
+      min-height: 18px;
+    }
+    .mono { font-family: var(--mono); }
+    @media (max-width: 860px) {
+      body { padding: 12px; }
+      .card { padding: 12px; }
+      .stat .v { font-size: 18px; }
+      canvas { max-height: 280px; }
+    }
   </style>
 </head>
 <body>
-  <div class="controls">
-    <h1 style="margin:0;">Cost reports</h1>
-    <span class="pill"><a href="/">Home</a></span>
-    <span class="pill"><a href="/request-key">Request key</a></span>
-    <form method="POST" action="/logout" style="margin:0;"><button type="submit" style="padding:6px 10px; border-radius:999px; border:1px solid var(--border); background:rgba(255,255,255,0.06); color:var(--text); cursor:pointer;">Log out</button></form>
-  </div>
-  <p>View cost by user and over time. Adjust the date range (UTC). Charts render entirely in the browser.</p>
-  <div class="controls">
-    <label for="start">Start</label><input type="date" id="start" />
-    <label for="end">End</label><input type="date" id="end" />
-    <button id="refresh" style="padding:10px 14px; border-radius:10px; border:1px solid var(--border); background: linear-gradient(120deg, #22d3ee, #a855f7); color: #0b1225; font-weight:700; cursor:pointer;">Refresh</button>
-    <span class="pill" id="period-label"></span>
-  </div>
-  <div class="grid">
-    <div class="card">
-      <h3 style="margin:0 0 6px;">Cost by user</h3>
-      <canvas id="costByUser"></canvas>
-    </div>
-    <div class="card">
-      <h3 style="margin:0 0 6px;">Daily cost + cumulative</h3>
-      <canvas id="totalByDay"></canvas>
-    </div>
-    <div class="card" style="grid-column: 1 / -1;">
-      <h3 style="margin:0 0 6px;">Stacked cost per day by user</h3>
-      <canvas id="stacked"></canvas>
-    </div>
-  </div>
-  <script>
-    const costCtx = document.getElementById('costByUser').getContext('2d');
-    const totalCtx = document.getElementById('totalByDay').getContext('2d');
-    const stackedCtx = document.getElementById('stacked').getContext('2d');
-    let costChart, totalChart, stackedChart;
+  <div class="layout">
+    <section class="card">
+      <div class="top">
+        <h1>Usage reports</h1>
+        <div class="nav">
+          <a class="pill-link" href="/">Home</a>
+          <a class="pill-link" href="/request-key">Request key</a>
+          <form method="POST" action="/logout" style="margin:0;"><button class="logout-btn" type="submit">Log out</button></form>
+        </div>
+      </div>
+      <p class="desc">Navigate usage by users, API keys, and time buckets. Metrics: cost, requests, input tokens, output tokens, and total tokens.</p>
+      <div class="control-grid">
+        <div>
+          <label for="scope">Report mode</label>
+          <select id="scope">
+            <option value="all_users">All users by time period</option>
+            <option value="user" selected>Each person by time period</option>
+            <option value="key">Each API key by time period</option>
+            <option value="user_key">Per-user key breakdown</option>
+          </select>
+        </div>
+        <div>
+          <label for="bucket">Time period</label>
+          <select id="bucket">
+            <option value="all">All time</option>
+            <option value="year">By year</option>
+            <option value="month">By month</option>
+            <option value="week">By week</option>
+            <option value="day" selected>By day</option>
+          </select>
+        </div>
+        <div>
+          <label for="metric">Metric</label>
+          <select id="metric">
+            <option value="cost" selected>Cost (USD)</option>
+            <option value="requests">Request count</option>
+            <option value="prompt_tokens">Input tokens</option>
+            <option value="completion_tokens">Output tokens</option>
+            <option value="total_tokens">Total tokens</option>
+          </select>
+        </div>
+        <div>
+          <label for="userFilter">User filter (optional)</label>
+          <select id="userFilter">
+            <option value="">All users</option>
+          </select>
+        </div>
+        <div>
+          <label for="start">Start (UTC)</label>
+          <input type="date" id="start" />
+        </div>
+        <div>
+          <label for="end">End (UTC)</label>
+          <input type="date" id="end" />
+        </div>
+        <div>
+          <label>&nbsp;</label>
+          <button id="refresh" class="primary">Refresh report</button>
+        </div>
+      </div>
+      <div class="range-pills">
+        <button data-range="30d">Last 30d</button>
+        <button data-range="90d">Last 90d</button>
+        <button data-range="365d">Last 365d</button>
+        <button data-range="ytd">YTD</button>
+      </div>
+      <div class="status" id="status"></div>
+    </section>
 
-    function defaultDates() {
-      const today = new Date();
-      const end = today.toISOString().slice(0,10);
-      const startDate = new Date(today.getTime() - 30*86400000);
-      const start = startDate.toISOString().slice(0,10);
-      document.getElementById('start').value = start;
-      document.getElementById('end').value = end;
+    <section class="stats">
+      <div class="stat"><div class="k">Cost</div><div class="v" id="s-cost">$0.00</div></div>
+      <div class="stat"><div class="k">Requests</div><div class="v" id="s-requests">0</div></div>
+      <div class="stat"><div class="k">Input tokens</div><div class="v" id="s-in">0</div></div>
+      <div class="stat"><div class="k">Output tokens</div><div class="v" id="s-out">0</div></div>
+      <div class="stat"><div class="k">Total tokens</div><div class="v" id="s-total">0</div></div>
+    </section>
+
+    <section class="viz-grid">
+      <article class="card">
+        <div class="title-row">
+          <h3>Trend</h3>
+          <span class="pill" id="period-pill"></span>
+        </div>
+        <canvas id="trendChart"></canvas>
+      </article>
+      <article class="card">
+        <div class="title-row">
+          <h3>Top totals</h3>
+          <span class="pill" id="mode-pill"></span>
+        </div>
+        <canvas id="totalsChart"></canvas>
+      </article>
+      <article class="card viz-wide">
+        <div class="title-row">
+          <h3>Stacked by label</h3>
+          <span class="pill" id="metric-pill"></span>
+        </div>
+        <canvas id="stackedChart"></canvas>
+      </article>
+      <article class="card viz-wide">
+        <div class="title-row">
+          <h3>Detailed rows</h3>
+          <span class="pill" id="rows-pill"></span>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Period</th>
+                <th>Label</th>
+                <th class="right">Cost</th>
+                <th class="right">Requests</th>
+                <th class="right">Input</th>
+                <th class="right">Output</th>
+                <th class="right">Total</th>
+              </tr>
+            </thead>
+            <tbody id="rowsBody"></tbody>
+          </table>
+        </div>
+      </article>
+    </section>
+  </div>
+
+  <script>
+    const COLORS = ['#22d3ee','#a855f7','#ef4444','#f59e0b','#10b981','#3b82f6','#f97316','#84cc16','#e879f9','#06b6d4','#14b8a6','#fb7185'];
+    const metricMeta = {
+      cost: { label: 'Cost (USD)' },
+      requests: { label: 'Request count' },
+      prompt_tokens: { label: 'Input tokens' },
+      completion_tokens: { label: 'Output tokens' },
+      total_tokens: { label: 'Total tokens' },
+    };
+
+    const controls = {
+      scope: document.getElementById('scope'),
+      bucket: document.getElementById('bucket'),
+      metric: document.getElementById('metric'),
+      userFilter: document.getElementById('userFilter'),
+      start: document.getElementById('start'),
+      end: document.getElementById('end'),
+      refresh: document.getElementById('refresh'),
+      status: document.getElementById('status'),
+    };
+
+    const summaryEls = {
+      cost: document.getElementById('s-cost'),
+      requests: document.getElementById('s-requests'),
+      input: document.getElementById('s-in'),
+      output: document.getElementById('s-out'),
+      total: document.getElementById('s-total'),
+    };
+
+    const pills = {
+      period: document.getElementById('period-pill'),
+      mode: document.getElementById('mode-pill'),
+      metric: document.getElementById('metric-pill'),
+      rows: document.getElementById('rows-pill'),
+    };
+
+    const rowsBody = document.getElementById('rowsBody');
+    const trendCtx = document.getElementById('trendChart').getContext('2d');
+    const totalsCtx = document.getElementById('totalsChart').getContext('2d');
+    const stackedCtx = document.getElementById('stackedChart').getContext('2d');
+    let trendChart, totalsChart, stackedChart;
+
+    function fmtInt(v) {
+      return Number(v || 0).toLocaleString('en-US');
     }
 
-    const USER_COLORS = ['#22d3ee','#a855f7','#ef4444','#f59e0b','#10b981','#3b82f6','#f97316','#84cc16'];
+    function fmtCurrency(v) {
+      return '$' + Number(v || 0).toFixed(2);
+    }
 
-    function buildUserColorMap(data) {
-      const labels = new Set();
-      for (const row of (data.cost_by_user || [])) labels.add(row.label || '—');
-      for (const row of ((data.stacked && data.stacked.series) || [])) labels.add(row.label || '—');
-      const sorted = Array.from(labels).sort((a, b) => a.localeCompare(b));
+    function fmtMetric(metric, value) {
+      if (metric === 'cost') return fmtCurrency(value);
+      return fmtInt(value);
+    }
+
+    function todayIso() {
+      return new Date().toISOString().slice(0, 10);
+    }
+
+    function setDateRangeByDays(days) {
+      const end = new Date();
+      const start = new Date(end.getTime() - days * 86400000);
+      controls.start.value = start.toISOString().slice(0, 10);
+      controls.end.value = end.toISOString().slice(0, 10);
+    }
+
+    function setYTD() {
+      const now = new Date();
+      controls.start.value = `${now.getUTCFullYear()}-01-01`;
+      controls.end.value = todayIso();
+    }
+
+    function defaultDates() {
+      setDateRangeByDays(30);
+    }
+
+    function updateDateControlState() {
+      const disabled = controls.bucket.value === 'all';
+      controls.start.disabled = disabled;
+      controls.end.disabled = disabled;
+    }
+
+    function populateUsers(users) {
+      const previous = controls.userFilter.value;
+      controls.userFilter.innerHTML = '<option value="">All users</option>';
+      (users || []).forEach(user => {
+        const opt = document.createElement('option');
+        opt.value = user;
+        opt.textContent = user;
+        controls.userFilter.appendChild(opt);
+      });
+      if (previous) controls.userFilter.value = previous;
+    }
+
+    function colorMapForLabels(labels) {
+      const sorted = [...labels].sort((a, b) => a.localeCompare(b));
       const map = new Map();
-      for (let i = 0; i < sorted.length; i += 1) {
-        map.set(sorted[i], USER_COLORS[i % USER_COLORS.length]);
-      }
+      sorted.forEach((label, i) => map.set(label, COLORS[i % COLORS.length]));
       return map;
     }
 
-    function colorForLabel(colorMap, label) {
-      return colorMap.get(label || '—') || USER_COLORS[0];
+    function buildAggregates(rows, metric) {
+      const periods = [];
+      const seenPeriods = new Set();
+      const periodTotals = new Map();
+      const labelTotals = new Map();
+      const matrix = new Map();
+
+      for (const row of rows) {
+        const period = row.period || '—';
+        const label = row.label || '—';
+        const value = Number(row[metric] || 0);
+        if (!seenPeriods.has(period)) {
+          seenPeriods.add(period);
+          periods.push(period);
+        }
+        periodTotals.set(period, (periodTotals.get(period) || 0) + value);
+        labelTotals.set(label, (labelTotals.get(label) || 0) + value);
+        if (!matrix.has(label)) matrix.set(label, new Map());
+        const labelMap = matrix.get(label);
+        labelMap.set(period, (labelMap.get(period) || 0) + value);
+      }
+
+      const labelsByTotal = [...labelTotals.entries()]
+        .sort((a, b) => b[1] - a[1])
+        .map(([label]) => label);
+
+      return { periods, periodTotals, labelTotals, matrix, labelsByTotal };
     }
 
-    function fmtCurrency(value) {
-      return '$' + (value || 0).toFixed(2);
+    function toStackedSeries(agg, maxSeries = 12) {
+      const topLabels = agg.labelsByTotal.slice(0, maxSeries);
+      const remaining = agg.labelsByTotal.slice(maxSeries);
+      const series = topLabels.map(label => ({
+        label,
+        values: agg.periods.map(period => (agg.matrix.get(label)?.get(period)) || 0),
+      }));
+      if (remaining.length > 0) {
+        const values = agg.periods.map(period => {
+          let sum = 0;
+          for (const label of remaining) sum += (agg.matrix.get(label)?.get(period)) || 0;
+          return sum;
+        });
+        series.push({ label: `Other (${remaining.length})`, values });
+      }
+      return series;
     }
 
-    async function loadData() {
-      const start = document.getElementById('start').value;
-      const end = document.getElementById('end').value;
-      const qs = new URLSearchParams();
-      if (start) qs.append('start', start);
-      if (end) qs.append('end', end);
-      const res = await fetch('/reports/data?' + qs.toString());
-      if (!res.ok) throw new Error('Unable to load data');
-      return res.json();
-    }
-
-    function renderCostByUser(data, colorMap) {
-      const labels = data.cost_by_user.map(d => d.label || '—');
-      const values = data.cost_by_user.map(d => d.cost || 0);
-      if (costChart) costChart.destroy();
-      costChart = new Chart(costCtx, {
-        type: 'bar',
-        data: {
-          labels,
-          datasets: [{
-            label: 'Cost',
-            data: values,
-            backgroundColor: labels.map(label => colorForLabel(colorMap, label)),
-          }]
-        },
-        options: { plugins: { tooltip: { callbacks: { label: ctx => fmtCurrency(ctx.parsed.y) } } }, scales: { y: { ticks: { callback: v => '$'+v } } } }
+    function tableRowsByValue(rows, metric) {
+      return [...rows].sort((a, b) => {
+        const av = Number(a[metric] || 0);
+        const bv = Number(b[metric] || 0);
+        if (bv !== av) return bv - av;
+        if ((a.period || '') !== (b.period || '')) return String(b.period || '').localeCompare(String(a.period || ''));
+        return String(a.label || '').localeCompare(String(b.label || ''));
       });
     }
 
-    function renderTotalByDay(data) {
-      const labels = data.total_by_day.map(d => d.day);
-      const values = data.total_by_day.map(d => d.cost || 0);
-      const cumulative = data.cumulative.map(d => d.cost || 0);
-      if (totalChart) totalChart.destroy();
-      totalChart = new Chart(totalCtx, {
+    function renderSummary(summary) {
+      summaryEls.cost.textContent = fmtCurrency(summary.cost);
+      summaryEls.requests.textContent = fmtInt(summary.requests);
+      summaryEls.input.textContent = fmtInt(summary.prompt_tokens);
+      summaryEls.output.textContent = fmtInt(summary.completion_tokens);
+      summaryEls.total.textContent = fmtInt(summary.total_tokens);
+    }
+
+    function destroyCharts() {
+      if (trendChart) trendChart.destroy();
+      if (totalsChart) totalsChart.destroy();
+      if (stackedChart) stackedChart.destroy();
+    }
+
+    function renderCharts(rows, metric, scope, bucket) {
+      destroyCharts();
+      const agg = buildAggregates(rows, metric);
+      const colorMap = colorMapForLabels(agg.labelsByTotal);
+      const yTick = (v) => fmtMetric(metric, v);
+      const tooltipLabel = (ctx) => `${ctx.dataset.label}: ${fmtMetric(metric, ctx.parsed.y)}`;
+
+      trendChart = new Chart(trendCtx, {
+        type: 'line',
         data: {
-          labels,
-          datasets: [
-            {
-              type: 'bar',
-              label: 'Daily cost',
-              data: values,
-              backgroundColor: 'rgba(34,211,238,0.5)',
-              borderColor: '#22d3ee',
-            },
-            {
-              type: 'line',
-              label: 'Cumulative',
-              data: cumulative,
-              borderColor: '#a855f7',
-              backgroundColor: 'transparent',
-              tension: 0.25,
-              yAxisID: 'y',
-            }
-          ]
+          labels: agg.periods,
+          datasets: [{
+            label: metricMeta[metric].label,
+            data: agg.periods.map(period => agg.periodTotals.get(period) || 0),
+            borderColor: '#22d3ee',
+            backgroundColor: 'rgba(34,211,238,0.15)',
+            fill: true,
+            tension: 0.2,
+          }],
         },
         options: {
-          scales: { y: { ticks: { callback: v => '$'+v } } },
-          plugins: { tooltip: { callbacks: { label: ctx => fmtCurrency(ctx.parsed.y) } } }
-        }
+          plugins: { tooltip: { callbacks: { label: (ctx) => fmtMetric(metric, ctx.parsed.y) } } },
+          scales: { y: { ticks: { callback: yTick } } },
+        },
       });
-    }
 
-    function renderStacked(data, colorMap) {
-      const labels = data.stacked.days;
-      const series = data.stacked.series;
-      if (stackedChart) stackedChart.destroy();
+      const topLabels = agg.labelsByTotal.slice(0, 16);
+      totalsChart = new Chart(totalsCtx, {
+        type: 'bar',
+        data: {
+          labels: topLabels,
+          datasets: [{
+            label: metricMeta[metric].label,
+            data: topLabels.map(label => agg.labelTotals.get(label) || 0),
+            backgroundColor: topLabels.map(label => colorMap.get(label) || COLORS[0]),
+          }],
+        },
+        options: {
+          indexAxis: 'y',
+          plugins: { tooltip: { callbacks: { label: (ctx) => fmtMetric(metric, ctx.parsed.x) } } },
+          scales: { x: { ticks: { callback: yTick } } },
+        },
+      });
+
+      const stackedSeries = toStackedSeries(agg);
       stackedChart = new Chart(stackedCtx, {
         type: 'bar',
         data: {
-          labels,
-          datasets: series.map(s=>({
-            label: s.label || '—',
-            data: s.costs,
-            backgroundColor: colorForLabel(colorMap, s.label),
-            stack: 'users'
-          }))
+          labels: agg.periods,
+          datasets: stackedSeries.map((series) => ({
+            label: series.label,
+            data: series.values,
+            backgroundColor: colorMap.get(series.label) || '#64748b',
+            stack: 'stack',
+          })),
         },
         options: {
+          plugins: { tooltip: { callbacks: { label: tooltipLabel } } },
           scales: {
             x: { stacked: true },
-            y: { stacked: true, ticks: { callback: v => '$'+v } }
+            y: { stacked: true, ticks: { callback: yTick } },
           },
-          plugins: { tooltip: { callbacks: { label: ctx => `${ctx.dataset.label}: ${fmtCurrency(ctx.parsed.y)}` } } }
-        }
+        },
       });
+
+      pills.period.textContent = bucket === 'all' ? 'All time' : `Bucket: ${bucket}`;
+      pills.mode.textContent = `Mode: ${scope}`;
+      pills.metric.textContent = metricMeta[metric].label;
+    }
+
+    function renderTable(rows, metric) {
+      rowsBody.innerHTML = '';
+      const sorted = tableRowsByValue(rows, metric).slice(0, 300);
+      for (const row of sorted) {
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+          <td>${row.period || '—'}</td>
+          <td class="mono">${row.label || '—'}</td>
+          <td class="right">${fmtCurrency(row.cost)}</td>
+          <td class="right">${fmtInt(row.requests)}</td>
+          <td class="right">${fmtInt(row.prompt_tokens)}</td>
+          <td class="right">${fmtInt(row.completion_tokens)}</td>
+          <td class="right">${fmtInt(row.total_tokens)}</td>
+        `;
+        rowsBody.appendChild(tr);
+      }
+      pills.rows.textContent = `${rows.length} rows`;
+    }
+
+    async function loadData() {
+      const qs = new URLSearchParams();
+      qs.set('scope', controls.scope.value);
+      qs.set('bucket', controls.bucket.value);
+      if (controls.userFilter.value) qs.set('user', controls.userFilter.value);
+      if (controls.bucket.value !== 'all') {
+        if (controls.start.value) qs.set('start', controls.start.value);
+        if (controls.end.value) qs.set('end', controls.end.value);
+      }
+      const res = await fetch('/reports/data?' + qs.toString());
+      if (!res.ok) throw new Error(`Unable to load report (${res.status})`);
+      return res.json();
     }
 
     async function refresh() {
-      document.getElementById('period-label').textContent = 'Loading…';
+      controls.status.textContent = 'Loading...';
+      updateDateControlState();
       try {
-        const data = await loadData();
-        const colorMap = buildUserColorMap(data);
-        renderCostByUser(data, colorMap);
-        renderTotalByDay(data);
-        renderStacked(data, colorMap);
-        const start = document.getElementById('start').value;
-        const end = document.getElementById('end').value;
-        document.getElementById('period-label').textContent = `${start} → ${end}`;
+        const payload = await loadData();
+        populateUsers(payload.users || []);
+        renderSummary(payload.summary || {});
+        renderCharts(payload.rows || [], controls.metric.value, controls.scope.value, controls.bucket.value);
+        renderTable(payload.rows || [], controls.metric.value);
+        let rangeText = 'All time';
+        if (controls.bucket.value !== 'all') {
+          rangeText = `${controls.start.value || '...'} to ${controls.end.value || '...'}`;
+        }
+        controls.status.textContent = `${rangeText} (UTC)`;
       } catch (err) {
-        document.getElementById('period-label').textContent = err.message || 'Error loading';
+        controls.status.textContent = err.message || 'Error loading report.';
       }
     }
 
-    document.getElementById('refresh').addEventListener('click', refresh);
+    controls.refresh.addEventListener('click', refresh);
+    controls.metric.addEventListener('change', refresh);
+    controls.scope.addEventListener('change', refresh);
+    controls.bucket.addEventListener('change', refresh);
+    controls.userFilter.addEventListener('change', refresh);
+    controls.start.addEventListener('change', refresh);
+    controls.end.addEventListener('change', refresh);
+
+    document.querySelectorAll('[data-range]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const key = btn.getAttribute('data-range');
+        if (key === '30d') setDateRangeByDays(30);
+        else if (key === '90d') setDateRangeByDays(90);
+        else if (key === '365d') setDateRangeByDays(365);
+        else if (key === 'ytd') setYTD();
+        controls.bucket.value = 'day';
+        refresh();
+      });
+    });
+
     defaultDates();
+    updateDateControlState();
     refresh();
   </script>
 </body>

@@ -274,6 +274,113 @@ def fetch_stacked_costs(start_ts: int, end_ts: int) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def fetch_report_users() -> list[str]:
+    with get_db() as conn:
+        rows = conn.execute("SELECT username FROM users ORDER BY username").fetchall()
+    return [str(r["username"]) for r in rows]
+
+
+def fetch_report_summary(start_ts: int, end_ts: int, username: Optional[str] = None) -> dict:
+    clauses = ["u.created_at >= ?", "u.created_at < ?"]
+    params: list[Any] = [start_ts, end_ts]
+    canonical_username = canonicalize_username(username) if username else None
+    if canonical_username:
+        clauses.append("usr.username = ?")
+        params.append(canonical_username)
+
+    where_sql = " AND ".join(clauses)
+    with get_db() as conn:
+        row = conn.execute(
+            f"""
+            SELECT COALESCE(SUM(u.cost), 0) AS cost,
+                   COALESCE(SUM(u.prompt_tokens), 0) AS prompt_tokens,
+                   COALESCE(SUM(u.completion_tokens), 0) AS completion_tokens,
+                   COALESCE(SUM(u.total_tokens), 0) AS total_tokens,
+                   COUNT(*) AS requests
+            FROM usage u
+            JOIN api_keys k ON k.id = u.token_id
+            JOIN users usr ON usr.id = k.user_id
+            WHERE {where_sql}
+            """,
+            tuple(params),
+        ).fetchone()
+    return dict(row) if row else {
+        "cost": 0.0,
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "total_tokens": 0,
+        "requests": 0,
+    }
+
+
+def fetch_report_rows(
+    start_ts: int,
+    end_ts: int,
+    bucket: str,
+    scope: str,
+    username: Optional[str] = None,
+) -> list[dict]:
+    period_expr_map = {
+        "all": "'All time'",
+        "year": "strftime('%Y', datetime(u.created_at, 'unixepoch'))",
+        "month": "strftime('%Y-%m', datetime(u.created_at, 'unixepoch'))",
+        "week": "strftime('%Y-W%W', datetime(u.created_at, 'unixepoch'))",
+        "day": "date(datetime(u.created_at, 'unixepoch'))",
+    }
+    period_sort_expr_map = {
+        "all": "0",
+        "year": "strftime('%Y', datetime(u.created_at, 'unixepoch'))",
+        "month": "strftime('%Y%m', datetime(u.created_at, 'unixepoch'))",
+        "week": "strftime('%Y%W', datetime(u.created_at, 'unixepoch'))",
+        "day": "strftime('%Y%m%d', datetime(u.created_at, 'unixepoch'))",
+    }
+    label_expr_map = {
+        "all_users": "'All users'",
+        "user": "usr.username",
+        "key": "usr.username || ' :: ' || COALESCE(NULLIF(trim(k.note), ''), '(no note)')",
+        "user_key": "usr.username || ' :: ' || COALESCE(NULLIF(trim(k.note), ''), '(no note)')",
+    }
+
+    if bucket not in period_expr_map:
+        raise ValueError(f"Unsupported bucket: {bucket}")
+    if scope not in label_expr_map:
+        raise ValueError(f"Unsupported scope: {scope}")
+
+    period_expr = period_expr_map[bucket]
+    period_sort_expr = period_sort_expr_map[bucket]
+    label_expr = label_expr_map[scope]
+
+    clauses = ["u.created_at >= ?", "u.created_at < ?"]
+    params: list[Any] = [start_ts, end_ts]
+    canonical_username = canonicalize_username(username) if username else None
+    if canonical_username:
+        clauses.append("usr.username = ?")
+        params.append(canonical_username)
+    where_sql = " AND ".join(clauses)
+
+    with get_db() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT {period_expr} AS period,
+                   {period_sort_expr} AS period_sort,
+                   {label_expr} AS label,
+                   COALESCE(SUM(u.cost), 0) AS cost,
+                   COALESCE(SUM(u.prompt_tokens), 0) AS prompt_tokens,
+                   COALESCE(SUM(u.completion_tokens), 0) AS completion_tokens,
+                   COALESCE(SUM(u.total_tokens), 0) AS total_tokens,
+                   COUNT(*) AS requests
+            FROM usage u
+            JOIN api_keys k ON k.id = u.token_id
+            JOIN users usr ON usr.id = k.user_id
+            WHERE {where_sql}
+            GROUP BY period, period_sort, label
+            ORDER BY period_sort, label
+            """,
+            tuple(params),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
 def fetch_active_keys_for_label(username: str) -> list[dict]:
     canonical_username = canonicalize_username(username)
     with get_db() as conn:
